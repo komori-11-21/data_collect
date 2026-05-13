@@ -1,0 +1,57 @@
+if main_df is not None and not main_df.empty:
+
+    st.markdown("#### 🔍 筛选条件")
+
+    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 3])
+
+    filtered_df = main_df.copy()
+
+    # 设备 ID 筛选
+    if "id" in filtered_df.columns:
+        id_options = sorted(filtered_df["id"].dropna().astype(str).unique().tolist())
+        selected_ids = filter_col1.multiselect(
+            "设备 ID",
+            options=id_options,
+            default=id_options
+        )
+
+        filtered_df = filtered_df[
+            filtered_df["id"].astype(str).isin(selected_ids)
+        ]
+
+    # 日期筛选
+    if "date" in filtered_df.columns:
+        date_options = sorted(filtered_df["date"].dropna().astype(str).unique().tolist())
+        selected_dates = filter_col2.multiselect(
+            "日期",
+            options=date_options,
+            default=date_options
+        )
+
+        filtered_df = filtered_df[
+            filtered_df["date"].astype(str).isin(selected_dates)
+        ]
+
+    # 指标分类筛选
+    if "指标分类" in filtered_df.columns:
+        metric_options = sorted(filtered_df["指标分类"].dropna().astype(str).unique().tolist())
+        selected_metrics = filter_col3.multiselect(
+            "指标分类",
+            options=metric_options,
+            default=metric_options
+        )
+
+        filtered_df = filtered_df[
+            filtered_df["指标分类"].astype(str).isin(selected_metrics)
+        ]
+
+    st.markdown("#### 📋 筛选结果")
+
+    st.dataframe(
+        filtered_df,
+        use_container_width=True,
+        height=400
+    )
+
+else:
+    st.warning("暂无数值型数据。")

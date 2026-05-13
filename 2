@@ -1,0 +1,83 @@
+st.markdown("### 📈 第一层：全局宏观追溯表")
+
+if main_df is not None and not main_df.empty:
+
+    st.markdown("#### 🔍 用户输入筛选条件")
+
+    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 3])
+
+    input_id = filter_col1.text_input(
+        "请输入设备 ID",
+        placeholder="例如：10001"
+    )
+
+    input_date = filter_col2.text_input(
+        "请输入日期",
+        placeholder="例如：2026-05-13"
+    )
+
+    input_metric = filter_col3.text_input(
+        "请输入指标关键字",
+        placeholder="例如：待机功耗 / 音量 / 休眠"
+    )
+
+    filtered_df = main_df.copy()
+
+    # 按设备 ID 筛选
+    if input_id.strip():
+        filtered_df = filtered_df[
+            filtered_df["id"].astype(str).str.contains(
+                input_id.strip(),
+                case=False,
+                na=False
+            )
+        ]
+
+    # 按日期筛选
+    if input_date.strip():
+        filtered_df = filtered_df[
+            filtered_df["date"].astype(str).str.contains(
+                input_date.strip(),
+                case=False,
+                na=False
+            )
+        ]
+
+    # 按指标分类筛选
+    if input_metric.strip():
+        filtered_df = filtered_df[
+            filtered_df["指标分类"].astype(str).str.contains(
+                input_metric.strip(),
+                case=False,
+                na=False
+            )
+        ]
+
+    st.markdown(f"#### 📋 筛选结果：{len(filtered_df)} 条")
+
+    st.dataframe(
+        filtered_df,
+        use_container_width=False,
+        height=400,
+        column_config={
+            "id": st.column_config.TextColumn(
+                "设备 ID",
+                width=120
+            ),
+            "date": st.column_config.TextColumn(
+                "日期",
+                width=120
+            ),
+            "指标分类": st.column_config.TextColumn(
+                "指标分类",
+                width=260
+            ),
+            "数值": st.column_config.TextColumn(
+                "数值",
+                width=140
+            )
+        }
+    )
+
+else:
+    st.warning("暂无数值型数据。")

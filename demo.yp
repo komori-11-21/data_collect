@@ -1,0 +1,218 @@
+import streamlit as st
+import pandas as pd
+import os
+import glob
+import plotly.express as px
+
+st.set_page_config(
+    page_title="全景功耗监控大屏",
+    page_icon="🌌",
+    layout="wide"
+)
+
+# =====================================================================
+# 🛠️ 核心硬编码配置区 (Hardcoded Configuration)
+# =====================================================================
+
+DATA_DIR = "./data_source"
+JOIN_KEYS = ["id", "date"]
+
+# 1. 静态数值类表（挂载到上半屏的表格）
+TABLE_CONFIGS = [
+    {
+        "keyword": "",  # 待机功耗
+        "type": "wide",
+    },
+
+    {
+        "keyword": "sleep",  # 休眠次数
+        "type": "wide",
+        "extract_cols": ["休眠次数"]
+    },
+    {
+        "keyword": "volume",  # 媒体音量表 (一天多次修改，配置为提取"业务维持时间最长"的一条)
+        "type": "long",
+        "item_col": "媒体种类",
+        "val_col": "音量值",
+        "dedup_rule": "longest_duration"  # 特殊清洗规则
+    },
+    {
+        "keyword": "apps",  # 应用耗电
+        "type": "long",
+        "item_col": "nfo2",
+        "val_col": "nfo2"
+    }
+]
+
+# 2. 状态事件类表（下半屏时间轴专用）
+EVENT_TABLE_KEYWORD = "events"
+
+# =====================================================================
+
+# --- 样式设计 ---
+st.markdown("""
+    <style>
+    .main { background-color: #f7f9fb; }
+    .title-box {
+        padding: 20px;
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+        margin-bottom: 20px;
+        text-align: center;
+        border-bottom: 4px solid #10ac84;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="title-box"><h2>🌌 智能功耗全景诊断大屏 (高级多日切片版)</h2></div>', unsafe_allow_html=True)
+
+
+
+# --- 核心数据加载与分离逻辑 ---
+# @st.cache_data(show_spinner=False)
+def load_data():
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.csv*"))
+    standard_dfs = []
+    event_df_list = []
+
+    for file_path in all_files:
+        file_name = os.path.basename(file_path).lower()
+        try:
+            df = pd.read_csv(file_path)
+            df.columns = df.columns.str.strip()
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        except Exception:
+            continue
+
+        # 分流：下半屏事件表
+        if EVENT_TABLE_KEYWORD in file_name:
+            if '发生时间' in df.columns:
+                df['发生时间'] = pd.to_datetime(df['发生时间'])
+            event_df_list.append(df)
+            continue
+
+        # 上半屏拼装
+        matched_config = next((cfg for cfg in TABLE_CONFIGS if cfg["keyword"].lower() in file_name), None)
+        if not matched_config: continue
+
+        p_keys = [k for k in JOIN_KEYS if k in df.columns]
+        order = TABLE_CONFIGS.index(matched_config)
+
+        if matched_config["type"] == "wide":
+            cols_to_melt = [c for c in matched_config["extract_cols"] if c in df.columns]
+            if cols_to_melt:
+                sub_df = df[p_keys + cols_to_melt].melt(id_vars=p_keys, value_vars=cols_to_melt, var_name='指标分类',
+                                                        value_name='数值')
+                sub_df['排序层级'] = order
+                standard_dfs.append(sub_df)
+
+        elif matched_config["type"] == "long":
+            item_col = matched_config.get("item_col")
+            val_col = matched_config.get("val_col")
+
+            if item_col in df.columns and val_col in df.columns:
+                sub_df = df.copy()
+
+                # 【新增核心逻辑】：业务停留时长最长的去重机制
+                if matched_config.get("dedup_rule") == "longest_duration" and '发生时间' in sub_df.columns:
+                    sub_df['发生时间'] = pd.to_datetime(sub_df['发生时间'])
+                    sub_df = sub_df.sort_values(by=p_keys + [item_col, '发生时间'])
+
+                    # 计算每次状态的维持时间 (当前条与下一条的时间差)
+                    sub_df['next_time'] = sub_df.groupby(p_keys + [item_col])['发生时间'].shift(-1)
+                    # 最后一条的 next_time 默认补全为当天深夜 23:59:59
+                    data_end = pd.to_datetime(sub_df['data']) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    sub_df['next_time'] = sub_df['next_time'].fillna(data_end)
+                    sub_df['duration'] = (sub_df['next_time'] - sub_df['发生时间']).dt.total_seconds()
+
+                    # 只保留 duration 最大的那一行！
+                    idx_max = sub_df.groupby(p_keys + [item_col])['duration'].idxmax()
+                    sub_df = sub_df.loc[idx_max].copy()
+
+                sub_df = sub_df[p_keys + [item_col, val_col]].copy()
+                sub_df.rename(columns={item_col: '指标分类', val_col: '数值'}, inplace=True)
+                sub_df['指标分类'] = " └─ " + sub_df['指标分类'].astype(str)
+                sub_df['排序层级'] = order
+                standard_dfs.append(sub_df)
+
+    main_df = pd.concat(standard_dfs, ignore_index=True) if standard_dfs else None
+    if main_df is not None:
+        sort_cols = [k for k in JOIN_KEYS if k in main_df.columns] + ['排序层级']
+        main_df = main_df.sort_values(by=sort_cols).reset_index(drop=True)
+        main_df.drop(columns=['排序层级'], inplace=True, errors='ignore')
+
+    events_merged = pd.concat(event_df_list, ignore_index=True) if event_df_list else pd.DataFrame()
+    return main_df, events_merged
+
+
+with st.spinner("加载后台多维大屏数据..."):
+    main_df, events_df = load_data()
+
+# =====================================================================
+# 📊 上半屏：宏观诊断与静态数值看板 (主表)
+# =====================================================================
+st.markdown("### 📈 第一层：全局宏观追溯表 (包含最长维持音量过滤)")
+if main_df is not None and not main_df.empty:
+    st.dataframe(main_df, use_container_width=True, height=400)
+else:
+    st.warning("暂无数值型数据。")
+
+# =====================================================================
+# ⏳ 下半屏：方案B - 多日切片平行时间轴
+# =====================================================================
+st.markdown("<br><hr>", unsafe_allow_html=True)
+st.markdown("### ⏳ 第二层：深入多日对齐时序分析 (方案B：折叠平行视图)")
+
+if events_df is not None and not events_df.empty:
+    unique_ids = sorted(events_df['id'].dropna().unique().tolist())
+    col1, col2 = st.columns([3, 7])
+    selected_id = col1.selectbox("🎯 选择要追溯的设备 ID", unique_ids)
+
+    available_dates = sorted(events_df[events_df['id'] == selected_id]['data'].unique().tolist())
+    # 【改动】变为多选下拉框！支持看多天
+    selected_dates = col2.multiselect("📅 挑选用于对比的多天日期 (将自动横向对齐切分)", available_dates,
+                                      default=available_dates[:min(2, len(available_dates))])
+
+    if selected_dates:
+        mask = (events_df['id'] == selected_id) & (events_df['data'].isin(selected_dates))
+        plot_df = events_df[mask].copy()
+
+        if plot_df.empty:
+            st.success("选定日期内无状态异常。")
+        else:
+            plot_df['发生时间'] = pd.to_datetime(plot_df['发生时间'])
+            # 【核心逻辑】：为了让多天的 X 轴(00:00-24:00) 能够完美平行重叠对齐，我们在画图时使用伪造的同一天日期，只展示其时间部分
+            plot_df['对齐渲染时间'] = pd.to_datetime('2000-01-01 ' + plot_df['发生时间'].dt.strftime('%H:%M:%S'))
+
+            # 【方案 B 切片图表绘制】
+            fig = px.scatter(
+                plot_df,
+                x="对齐渲染时间",
+                y="状态名",
+                color="动作",
+                symbol="动作",
+                facet_row="data",  # 核心参数：根据选择的日期，把它像三明治一样一层层切开！
+                title=f"【{selected_id}】连续多天核心状态横向对齐对比",
+                height=150 + 150 * len(selected_dates)  # 根据天数自适应高度
+            )
+
+            fig.update_traces(marker=dict(size=14, line=dict(width=1, color='white')))
+
+            # 去掉 y 轴的多余标题，让界面更清爽
+            fig.update_yaxes(matches=None, title_text="")
+            # 强制 x 轴只显示时分秒，不显示那个 2000 年的伪造日期
+            fig.update_xaxes(tickformat="%H:%M", title_text="24 小时绝对对齐轴")
+
+            fig.update_layout(
+                plot_bgcolor="#fcfcfc",
+                xaxis=dict(showgrid=True, gridcolor="#e0e0e0"),
+                margin=dict(l=20, r=20, t=50, b=20)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+else:
+    st.warning("暂无事件类数据。")
+
+if __name__ == '__main__':
+    load_data()

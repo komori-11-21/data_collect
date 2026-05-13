@@ -1,0 +1,17 @@
+# 使用 Excel / CSV 中已有的时长字段，保留时长最长的一条
+if matched_config.get("dedup_rule") == "longest_duration":
+    duration_col = matched_config.get("duration_col", "时长")
+
+    if duration_col in sub_df.columns:
+        sub_df[duration_col] = pd.to_numeric(
+            sub_df[duration_col],
+            errors="coerce"
+        )
+
+        sub_df = sub_df.dropna(subset=[duration_col])
+
+        idx_max = sub_df.groupby(p_keys + [item_col])[duration_col].idxmax()
+
+        sub_df = sub_df.loc[idx_max].copy()
+    else:
+        st.warning(f"{file_name} 中没有找到时长字段：{duration_col}")

@@ -1,0 +1,656 @@
+import streamlit as st
+import pandas as pd
+import os
+import glob
+import io
+import plotly.express as px
+
+# =====================================================================
+# 页面初始化配置
+# =====================================================================
+st.set_page_config(
+    page_title="全景功耗监控大屏",
+    page_icon="🌌",
+    layout="wide"
+)
+
+st.markdown("""
+<style>
+/* 强制隐藏 Form 内文本输入框自带的 "Press Enter to submit form" 英文提示 */
+div[data-testid="InputInstructions"] {
+    display: none !important;
+}
+.main { background-color: #f4f6f9; }
+.title-box {
+    padding: 30px;
+    background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+    border-radius: 12px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+    margin-bottom: 25px;
+    text-align: center;
+    color: white;
+}
+.title-box h2 {
+    color: white !important;
+    margin: 0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-weight: 600;
+    letter-spacing: 1px;
+}
+/* 调整 Metric 卡片样式 */
+div[data-testid="metric-container"] {
+    background-color: white;
+    padding: 15px 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    border-left: 4px solid #2a5298;
+}
+/* 侧边栏纯净导航 CSS 深度优化 */
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    padding: 12px 15px;
+    background-color: transparent;
+    border-radius: 8px;
+    margin-bottom: 5px;
+    transition: all 0.2s ease;
+    cursor: pointer;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background-color: #f0f2f6;
+    transform: translateX(4px);
+}
+[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child { display: none !important; }
+[data-testid="stSidebar"] [role="radiogroup"] div[data-testid="stMarkdownContainer"] p {
+    font-size: 16px;
+    font-weight: 500;
+    margin: 0;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label[aria-checked="true"] {
+    background-color: #e6f0fa !important;
+    border-left: 4px solid #1e3c72 !important;
+    color: #1e3c72 !important;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label[aria-checked="true"] p {
+    color: #1e3c72 !important;
+    font-weight: bold;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =====================================================================
+# 🛠️ 核心硬编码配置区 (Hardcoded Configuration)
+# =====================================================================
+DATA_DIR = "./data_source"
+JOIN_KEYS = ["id", "data"] # 内部统一使用的标准合并键（不要改这里）
+
+# ⚠️ 注意：如果你的真实数据表头不一样，请务必修改这里的 val_col, time_col, item_col 等！
+TABLE_CONFIGS = [
+    {
+        "keyword": "standby",      # 你的真实文件名必须包含 standby
+        "type": "wide",
+        "label": "待机",
+        "val_col": "待机功耗",      # ← 修改为真实的表头名称，如 "StandbyCurrent"
+        "time_col": "待机时长",     # ← 修改为真实的表头名称
+        "val_unit": "mA",
+        "time_unit": "s"
+    },
+    {
+        "keyword": "apps",         # 你的真实文件名必须包含 apps
+        "type": "long",
+        "item_col": "应用名称",
+        "val_col": "功耗值",
+        "time_col": "使用时长",
+        "val_unit": "mA",
+        "time_unit": "s"
+    },
+    {
+        "keyword": "volume",       # 你的真实文件名必须包含 volume
+        "type": "long",
+        "item_col": "媒体种类",
+        "val_col": "音量值",
+        "time_col": "持续时长",
+        "val_unit": "%",
+        "time_unit": "s",
+        "dedup_rule": "longest_duration"
+    },
+    {
+        "keyword": "sleep",        # 你的真实文件名必须包含 sleep
+        "type": "wide",
+        "label": "休眠",
+        "val_col": "休眠次数",
+        "val_unit": "次"
+    },
+    {
+        "keyword": "events",       # 你的真实文件名必须包含 events
+        "type": "event",
+        "item_col": "状态名",
+        "action_col": "动作"
+    },
+    {
+        "keyword": "app_detail",   # 你的真实文件名必须包含 app_detail
+        "type": "app_detail",
+        "app_col": "应用名称",
+        "duration_col": "运行时长",
+        "power_col": "功耗值"
+    }
+]
+
+# =====================================================================
+# --- 模拟数据生成 (如果您已有真实数据，这段可注释掉) ---
+# =====================================================================
+def ensure_mock_data():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+        standby_data = [{"id": "DEV_001", "data": "2026-05-01", "待机功耗": 15, "待机时长": 120}]
+        pd.DataFrame(standby_data).to_excel(os.path.join(DATA_DIR, "table_1_standby.xlsx"), index=False)
+        # 为节约代码长度，模拟数据只生成一个演示文件。
+        # 如果你已有真实 Excel 放到 data_source 中，代码会自动读取。
+
+ensure_mock_data()
+
+# =====================================================================
+# 🚀 智能列名标准化函数 (解决真实数据字段与系统代码不一致的问题)
+# =====================================================================
+def standardize_columns(df):
+    """智能列名兼容映射函数"""
+    # 强制去除列名前后的隐藏空格
+    df.columns = df.columns.str.strip()
+    
+    rename_map = {}
+    for col in df.columns:
+        col_lower = str(col).lower()
+        
+        # 匹配你的各种 ID 字段，统一改为 'id' (在此处添加你实际使用的ID表头名)
+        if col_lower in ['id', 'deviceid', 'device_id', '设备id', '设备编号', 'sn', 'uuid', 'mac']:
+            rename_map[col] = 'id'
+            
+        # 匹配你的各种 Date 字段，统一改为代码底层的 'data' (在此处添加你实际使用的日期表头名)
+        elif col_lower in ['date', 'data', '日期', '时间', '创建时间', '测试日期', 'test_date']:
+            rename_map[col] = 'data'
+            
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+        
+    return df
+
+# =====================================================================
+# --- 核心数据加载与分离逻辑 ---
+# =====================================================================
+# @st.cache_data(show_spinner=False) # 开发调试期可注释缓存，确保实时读新文件
+def load_data():
+    # 修复：匹配后缀为xls或xlsx的文件
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))
+    standard_dfs = []
+
+    for file_path in all_files:  
+        file_name = os.path.basename(file_path).lower()  
+        try:  
+            df = pd.read_excel(file_path)  
+            
+            # 🚀 调用标准化函数：强行统一表头
+            df = standardize_columns(df)
+            
+            if 'data' in df.columns:  
+                df['data'] = pd.to_datetime(df['data'], errors='coerce').dt.strftime('%Y-%m-%d')  
+        except Exception as e:
+            st.toast(f"解析文件 {file_name} 失败: {str(e)}")
+            continue  
+
+        # 核心解析拼装  
+        matched_config = next((cfg for cfg in TABLE_CONFIGS if cfg["keyword"].lower() in file_name), None)  
+        if not matched_config: 
+            continue  
+
+        p_keys = [k for k in JOIN_KEYS if k in df.columns]  
+        order = TABLE_CONFIGS.index(matched_config)  
+
+        if matched_config["type"] == "wide":  
+            sub_df = df.copy()  
+            label = matched_config["label"]  
+            v_col = matched_config.get("val_col")  
+            t_col = matched_config.get("time_col")  
+            v_unit = matched_config.get("val_unit", "")  
+            t_unit = matched_config.get("time_unit", "")  
+              
+            unit_suffix = ""  
+            if v_unit and t_unit:  
+                unit_suffix = f" ({v_unit} | {t_unit})"  
+            elif v_unit:  
+                unit_suffix = f" ({v_unit})"  
+              
+            sub_df['指标分类'] = label + unit_suffix  
+            sub_df['数值'] = sub_df[v_col] if v_col in sub_df.columns else ""  
+            sub_df['时长'] = sub_df[t_col] if t_col and t_col in sub_df.columns else ""  
+              
+            # 确保必要列存在
+            cols_to_keep = [c for c in (p_keys + ['指标分类', '时长', '数值']) if c in sub_df.columns]
+            sub_df = sub_df[cols_to_keep]  
+            sub_df['排序层级'] = order  
+            standard_dfs.append(sub_df)  
+
+        elif matched_config["type"] == "long":  
+            item_col = matched_config.get("item_col")  
+            v_col = matched_config.get("val_col")  
+            t_col = matched_config.get("time_col")  
+            v_unit = matched_config.get("val_unit", "")  
+            t_unit = matched_config.get("time_unit", "")  
+              
+            unit_suffix = f" ({v_unit} | {t_unit})" if v_unit and t_unit else (f" ({v_unit})" if v_unit else "")
+
+            if item_col in df.columns:  
+                sub_df = df.copy()  
+
+                # 业务停留时长最长的去重机制  
+                if matched_config.get("dedup_rule") == "longest_duration":  
+                    if t_col and t_col in sub_df.columns:  
+                        sub_df['duration_tmp'] = pd.to_numeric(sub_df[t_col], errors='coerce').fillna(0)  
+                        idx_max = sub_df.groupby(p_keys + [item_col])['duration_tmp'].idxmax()  
+                        sub_df = sub_df.loc[idx_max].copy()  
+                    elif '发生时间' in sub_df.columns:  
+                        sub_df['发生时间'] = pd.to_datetime(sub_df['发生时间'], errors='coerce')  
+                        sub_df = sub_df.sort_values(by=p_keys + [item_col, '发生时间'])  
+                        sub_df['next_time'] = sub_df.groupby(p_keys + [item_col])['发生时间'].shift(-1)  
+                        
+                        data_end = pd.to_datetime(sub_df['data']) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  
+                        sub_df['next_time'] = sub_df['next_time'].fillna(data_end)  
+                        sub_df['duration_tmp'] = (sub_df['next_time'] - sub_df['发生时间']).dt.total_seconds()  
+                        
+                        idx_max = sub_df.groupby(p_keys + [item_col])['duration_tmp'].idxmax()  
+                        sub_df = sub_df.loc[idx_max].copy()  
+
+                sub_df['指标分类'] = " └─ " + sub_df[item_col].astype(str) + unit_suffix  
+                sub_df['数值'] = sub_df[v_col] if v_col and v_col in sub_df.columns else ""  
+                sub_df['时长'] = sub_df[t_col] if t_col and t_col in sub_df.columns else ""  
+
+                cols_to_keep = [c for c in (p_keys + ['指标分类', '时长', '数值']) if c in sub_df.columns]
+                sub_df = sub_df[cols_to_keep]    
+                sub_df['排序层级'] = order  
+                standard_dfs.append(sub_df)  
+
+        elif matched_config["type"] == "event":  
+            item_col = matched_config.get("item_col")  
+            act_col = matched_config.get("action_col")  
+              
+            if item_col in df.columns and act_col in df.columns:  
+                sub_df = df.copy()  
+                  
+                if '发生时间' in sub_df.columns:  
+                    sub_df['发生时间'] = pd.to_datetime(sub_df['发生时间'], errors='coerce')  
+                    sub_df = sub_df.sort_values(by=p_keys + [item_col, '发生时间'])  
+                      
+                    # 状态流去抖 (Debounce)
+                    sub_df['prev_act'] = sub_df.groupby(p_keys + [item_col])[act_col].shift(1)  
+                    sub_df = sub_df[sub_df[act_col] != sub_df['prev_act']].copy()  
+
+                    time_str = sub_df['发生时间'].dt.strftime('%H:%M:%S')  
+                    sub_df['轨迹点'] = "[" + time_str + "] " + sub_df[act_col].astype(str)  
+                      
+                    agg_df = sub_df.groupby(p_keys + [item_col])['轨迹点'].apply(lambda x: " ➜ ".join(x)).reset_index()  
+                    agg_df['数值'] = agg_df['轨迹点']  
+                else:  
+                    agg_df = sub_df.groupby(p_keys + [item_col])[act_col].apply(lambda x: " | ".join(x.astype(str).unique())).reset_index()  
+                    agg_df['数值'] = agg_df[act_col]  
+
+                agg_df['指标分类'] = " ⭐ " + agg_df[item_col].astype(str)  
+                agg_df['时长'] = ""  
+                agg_df['排序层级'] = order  
+                  
+                cols_to_keep = [c for c in (p_keys + ['指标分类', '时长', '数值', '排序层级']) if c in agg_df.columns]
+                standard_dfs.append(agg_df[cols_to_keep])  
+
+    if not standard_dfs:
+        return None
+
+    main_df = pd.concat(standard_dfs, ignore_index=True)
+    # 按公共列排序
+    sort_cols = [k for k in JOIN_KEYS if k in main_df.columns] + ['排序层级']  
+    main_df = main_df.sort_values(by=sort_cols).reset_index(drop=True)  
+
+    return main_df
+
+def load_app_detail_raw():
+    """加载应用明细原始数据（不聚合，供钻取页面使用）"""
+    cfg = next((c for c in TABLE_CONFIGS if c.get('type') == 'app_detail'), None)
+    if not cfg:
+        return None
+
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))  
+    dfs = []  
+    for fp in all_files:  
+        if cfg['keyword'].lower() in os.path.basename(fp).lower():  
+            try:  
+                df = pd.read_excel(fp)  
+                
+                # 🚀 同样在此应用智能列头标准化
+                df = standardize_columns(df)
+                
+                if 'data' in df.columns:  
+                    df['data'] = pd.to_datetime(df['data'], errors='coerce').dt.strftime('%Y-%m-%d')  
+                dfs.append(df)  
+            except Exception:  
+                continue  
+    if dfs:  
+        return pd.concat(dfs, ignore_index=True)  
+    return None
+
+with st.spinner("加载后台多维大屏数据..."):
+    main_df = load_data()
+    app_detail_df = load_app_detail_raw()
+
+
+# =====================================================================
+# 📊 前端交互与视图区
+# =====================================================================
+if main_df is not None and not main_df.empty:
+    # 🎯 全局控制中枢 (侧边栏)
+    with st.sidebar:
+        st.markdown("## 🧭 系统导航")
+        menu = st.radio("请选择控制台模块", ["📊 全景数据大盘", "📦 报表导出中心", "📱 应用钻取分析"])
+
+    # 提取有效日期范围  
+    date_series = pd.to_datetime(main_df["data"].dropna(), errors='coerce').dropna()
+    min_date = date_series.min().date() if not date_series.empty else pd.Timestamp.today().date()
+    max_date = date_series.max().date() if not date_series.empty else pd.Timestamp.today().date()
+
+    # 动态切换页面标题  
+    if menu == "📊 全景数据大盘":  
+        st.markdown('<div class="title-box"><h2>🌌 智能数据中台：全景状态追溯诊断大屏</h2></div>', unsafe_allow_html=True)  
+    elif menu == "📦 报表导出中心":  
+        st.markdown('<div class="title-box" style="background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%);"><h2>📦 智能数据中台：高级报表批量导出车间</h2></div>', unsafe_allow_html=True)  
+
+    # 漏斗 UI（固定 key，不随菜单变化）  
+    with st.expander("🔍 数据漏斗 (筛选范围)", expanded=True):  
+        with st.form(key="global_filter_form"):  
+            col_f1, col_f2, col_f3 = st.columns([3, 3, 2])  
+            with col_f1:  
+                selected_id = st.text_input("🎯 设备 ID (模糊搜索，留空查全量)")  
+            with col_f2:  
+                selected_date_range = st.date_input("📅 筛选日期区间", value=(min_date, max_date), min_value=min_date, max_value=max_date)  
+            with col_f3:  
+                st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)  
+                st.form_submit_button("应用筛选条件", use_container_width=True)  
+
+    # 执行过滤逻辑  
+    filtered_df = main_df.copy()  
+    if selected_id.strip():  
+        filtered_df = filtered_df[filtered_df["id"].astype(str).str.contains(selected_id.strip(), case=False, na=False)]  
+    
+    # 修复日期选取器逻辑
+    if selected_date_range:  
+        if len(selected_date_range) == 2:  
+            s_d, e_d = selected_date_range  
+            filtered_df = filtered_df[  
+                (pd.to_datetime(filtered_df["data"]).dt.date >= s_d) &  
+                (pd.to_datetime(filtered_df["data"]).dt.date <= e_d)  
+            ]  
+        elif len(selected_date_range) == 1:  
+            s_d = selected_date_range[0]  
+            filtered_df = filtered_df[pd.to_datetime(filtered_df["data"]).dt.date == s_d]  
+
+    def hide_repeated(df_target, col_name):  
+        if col_name in df_target.columns:  
+            s = df_target[col_name].copy()  
+            s[s == s.shift()] = ""  
+            df_target[col_name] = s  
+        return df_target  
+
+    # ==========================================  
+    # 🗂️ 路由分发区 (主舞台)  
+    # ==========================================  
+    if menu == "📊 全景数据大盘":  
+        # 顶层 Metrics 数据板  
+        total_devices = filtered_df['id'].nunique() if 'id' in filtered_df.columns else 0
+        
+        # 修复天数计算 bug
+        days_span = 1
+        if len(selected_date_range) == 2:
+            days_span = (selected_date_range[1] - selected_date_range[0]).days + 1
+
+        total_records = len(filtered_df)  
+
+        col1, col2, col3 = st.columns(3)  
+        col1.metric("🖥️ 当前检出设备", f"{total_devices} 台")  
+        col2.metric("📅 追踪时间跨度", f"{days_span} 天")  
+        col3.metric("📊 追溯记录总数", f"{total_records} 条")  
+
+        st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px dashed #ccc;'/>", unsafe_allow_html=True)  
+        st.markdown("### 🗂️ 全局状态追溯卷宗")  
+
+        ui_display_df = filtered_df.drop(columns=['排序层级'], errors='ignore')  
+        ui_display_df = hide_repeated(ui_display_df, 'id')  
+
+        st.dataframe(ui_display_df, use_container_width=True, height=700, hide_index=True)  
+
+    elif menu == "📦 报表导出中心":  
+        st.info("💡 下方导出策略已自动继承页面上方的【数据漏斗】范围。您可以直接全量生成，或开启微操对局部设备进行干预。")  
+          
+        available_ids = sorted(filtered_df['id'].dropna().unique().tolist()) if 'id' in filtered_df.columns else []
+        export_date_config = {}  
+          
+        if available_ids:  
+            with st.container():  
+                st.markdown("#### ⚙️ 高级配置 (选配)")  
+                enable_micro_config = st.checkbox("🚀 开启设备级独立日期选配 (干预特定设备的导出日期)")  
+                  
+                if enable_micro_config:  
+                    st.caption("为避免海量设备造成配置面板冗长，请首先挑选需要干预的设备：")  
+                    target_micro_devices = st.multiselect("🎯 检索并选中需要特别配置的设备", available_ids)  
+                      
+                    if target_micro_devices:  
+                        st.markdown("##### 👇 分设备日期配置台")  
+                        cols = st.columns(min(len(target_micro_devices), 3) or 1)  
+                        for idx, dev_id in enumerate(target_micro_devices):  
+                            dev_dates = sorted(filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())  
+                            with cols[idx % 3]:  
+                                export_date_config[dev_id] = st.multiselect(  
+                                    f"👉 {dev_id}",  
+                                    options=dev_dates,  
+                                    default=dev_dates,  
+                                    key=f"export_{dev_id}"  
+                                )  
+                      
+                    for dev_id in available_ids:  
+                        if dev_id not in target_micro_devices:  
+                            export_date_config[dev_id] = sorted(filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())  
+                else:  
+                    for dev_id in available_ids:  
+                        export_date_config[dev_id] = sorted(filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())  
+                          
+            # 导出生成逻辑  
+            output = io.BytesIO()  
+            has_data = False  
+              
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:  
+                sheet_name = '透视诊断结果'  
+                current_row = 0  
+                  
+                if export_date_config:  
+                    for dev_id, sel_dates in export_date_config.items():  
+                        if sel_dates:  
+                            chunk = filtered_df[(filtered_df["id"] == dev_id) & (filtered_df["data"].isin(sel_dates))]  
+                            if not chunk.empty and 'data' in chunk.columns:  
+                                has_data = True  
+                                  
+                                pivot_df = chunk.pivot_table(index=['id', '排序层级', '指标分类'], columns='data', values=['时长', '数值'], aggfunc='first')  
+                                new_cols = [f"{c[1]} {c[0]}" for c in pivot_df.columns]  
+                                pivot_df.columns = new_cols  
+                                  
+                                def col_sort_key(c):  
+                                    if ' 时长' in c: return c.replace(' 时长', '_0_时长')  
+                                    elif ' 数值' in c: return c.replace(' 数值', '_1_数值')  
+                                    return c  
+                                      
+                                pivot_df = pivot_df.reindex(sorted(pivot_df.columns, key=col_sort_key), axis=1).reset_index()  
+                                pivot_df = pivot_df.sort_values(by=['id', '排序层级']).reset_index(drop=True)  
+                                pivot_df.drop(columns=['排序层级'], inplace=True, errors='ignore')  
+                                  
+                                pivot_df = hide_repeated(pivot_df, 'id')  
+                                  
+                                pivot_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=current_row)  
+                                current_row += len(pivot_df) + 2  
+                                  
+                if not has_data:  
+                    pd.DataFrame({"提示": ["暂无数据或未在配置中勾选日期"]}).to_excel(writer, index=False, sheet_name='空数据')  
+                else:  
+                    worksheet = writer.sheets[sheet_name]  
+                    worksheet.column_dimensions['A'].width = 18  
+                    worksheet.column_dimensions['B'].width = 35  
+                    for i in range(3, min(26, worksheet.max_column + 1)):  
+                        worksheet.column_dimensions[chr(64 + i)].width = 18  
+                      
+            excel_data = output.getvalue()  
+              
+            st.markdown("<hr style='margin: 30px 0; border: none; border-top: 1px solid #eee;'/>", unsafe_allow_html=True)  
+            col_btn_center = st.columns([1, 2, 1])  
+            with col_btn_center[1]:  
+                st.download_button(  
+                    label="📥 立即生成并下载级联式宽表 (Excel)",  
+                    data=excel_data,  
+                    file_name="诊断结果_断层级联版.xlsx",  
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  
+                    use_container_width=True,  
+                    type="primary"  
+                )  
+        else:  
+            st.warning("⚠️ 全局漏斗未命中任何数据，请放宽搜索条件。")  
+
+    elif menu == "📱 应用钻取分析":  
+        st.markdown('<div class="title-box" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);"><h2>📱 应用运行明细钻取分析</h2></div>', unsafe_allow_html=True)  
+          
+        if app_detail_df is not None and not app_detail_df.empty:  
+            cfg = next((c for c in TABLE_CONFIGS if c.get('type') == 'app_detail'), {})  
+            app_col = cfg.get('app_col', '应用名称')  
+            dur_col = cfg.get('duration_col', '运行时长')  
+            pwr_col = cfg.get('power_col', '功耗值')  
+              
+            st.markdown("#### 🎯 钻取条件")  
+            ctl1, ctl2, ctl3, ctl4 = st.columns([2, 2, 2, 2])  
+              
+            with ctl1:  
+                avail_ids = sorted(app_detail_df['id'].unique().tolist()) if 'id' in app_detail_df.columns else [] 
+                sel_dev = st.selectbox("🖥️ 选择设备", avail_ids)  
+              
+            dev_df = app_detail_df[app_detail_df['id'] == sel_dev] if sel_dev else app_detail_df
+              
+            with ctl2:  
+                avail_dates = sorted(dev_df['data'].unique().tolist()) if 'data' in dev_df.columns else [] 
+                sel_date = st.selectbox("📅 选择日期", avail_dates)  
+              
+            date_df = dev_df[dev_df['data'] == sel_date] if sel_date else dev_df
+              
+            with ctl3:  
+                avail_apps = sorted(date_df[app_col].unique().tolist()) if app_col in date_df.columns else []
+                sel_app = st.selectbox("📱 选择应用", ["全部应用"] + avail_apps)  
+              
+            with ctl4:  
+                min_duration = st.number_input("⏱ 时长阈值 (秒)，仅展示≥此值的记录", min_value=0, value=0, step=10)  
+              
+            # 执行钻取过滤  
+            detail = date_df.copy()  
+            if sel_app != "全部应用":  
+                detail = detail[detail[app_col] == sel_app]  
+            if min_duration > 0 and dur_col in detail.columns:  
+                detail[dur_col] = pd.to_numeric(detail[dur_col], errors='coerce').fillna(0)  
+                detail = detail[detail[dur_col] >= min_duration]  
+              
+            st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px dashed #ccc;'/>", unsafe_allow_html=True)  
+              
+            if detail.empty:  
+                st.warning("⚠️ 当前条件下无匹配记录，请调低时长阈值或更换筛选。")  
+            else:  
+                total_runs = len(detail)  
+                total_dur = pd.to_numeric(detail[dur_col], errors='coerce').sum() if dur_col in detail.columns else 0
+                total_pwr = pd.to_numeric(detail[pwr_col], errors='coerce').sum() if pwr_col in detail.columns else 0
+                avg_dur = total_dur / total_runs if total_runs > 0 else 0  
+                  
+                m1, m2, m3, m4 = st.columns(4)  
+                m1.metric("🔁 运行次数", f"{total_runs} 次")  
+                m2.metric("⏱ 总时长", f"{total_dur:.0f} 秒")  
+                m3.metric("⚡ 总功耗", f"{total_pwr:.0f} mA")  
+                m4.metric("📊 平均时长", f"{avg_dur:.1f} 秒/次")  
+                  
+                st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px dashed #ccc;'/>", unsafe_allow_html=True)  
+                  
+                chart_df = detail.copy()  
+                if dur_col in chart_df.columns: chart_df[dur_col] = pd.to_numeric(chart_df[dur_col], errors='coerce').fillna(0)
+                if pwr_col in chart_df.columns: chart_df[pwr_col] = pd.to_numeric(chart_df[pwr_col], errors='coerce').fillna(0)
+                chart_df = chart_df.reset_index(drop=True)  
+                  
+                row1_c1, row1_c2 = st.columns(2)  
+                  
+                with row1_c1:  
+                    if app_col in chart_df.columns and dur_col in chart_df.columns:
+                        agg_app = chart_df.groupby(app_col).agg(  
+                            总时长=(dur_col, 'sum'),  
+                            总功耗=(pwr_col, 'sum') if pwr_col in chart_df.columns else (dur_col, 'count'),  
+                            运行次数=(dur_col, 'count')  
+                        ).reset_index()  
+                          
+                        fig_donut = px.pie(  
+                            agg_app, names=app_col, values='总时长',  
+                            title="🍩 各应用运行时长占比",  
+                            hole=0.45,  
+                            color_discrete_sequence=px.colors.qualitative.Set2  
+                        )  
+                        fig_donut.update_traces(textposition='inside', textinfo='label+percent')  
+                        fig_donut.update_layout(height=380, showlegend=False)  
+                        st.plotly_chart(fig_donut, use_container_width=True)  
+                  
+                with row1_c2:  
+                    if dur_col in chart_df.columns and pwr_col in chart_df.columns:
+                        fig_scatter = px.scatter(  
+                            chart_df, x=dur_col, y=pwr_col,  
+                            color=app_col, size=pwr_col,  
+                            title="🫧 时长 × 功耗关联分析 (气泡越大功耗越高)",  
+                            labels={dur_col: "运行时长 (秒)", pwr_col: "功耗 (mA)"},  
+                            color_discrete_sequence=px.colors.qualitative.Bold,  
+                            size_max=40  
+                        )  
+                        fig_scatter.update_layout(height=380)  
+                        st.plotly_chart(fig_scatter, use_container_width=True)  
+                  
+                row2_c1, row2_c2 = st.columns(2)  
+                  
+                with row2_c1:  
+                    if app_col in chart_df.columns and dur_col in chart_df.columns:
+                        chart_df['运行编号'] = chart_df.groupby(app_col).cumcount() + 1  
+                        chart_df['标签'] = chart_df[app_col] + " #" + chart_df['运行编号'].astype(str)  
+                          
+                        fig_bar = px.bar(  
+                            chart_df, x=app_col, y=dur_col, color='标签',  
+                            title="📊 分应用运行时长堆叠",  
+                            labels={dur_col: "时长 (秒)", app_col: "应用"},  
+                            color_discrete_sequence=px.colors.qualitative.Pastel  
+                        )  
+                        fig_bar.update_layout(height=380, showlegend=True, barmode='stack')  
+                        st.plotly_chart(fig_bar, use_container_width=True)  
+                  
+                with row2_c2:  
+                    if app_col in chart_df.columns and dur_col in chart_df.columns and pwr_col in chart_df.columns:
+                        # 确保 Treemap 值全部为正
+                        tree_df = chart_df[chart_df[dur_col] > 0]
+                        if not tree_df.empty:
+                            fig_tree = px.treemap(  
+                                tree_df, path=[app_col], values=dur_col,  
+                                color=pwr_col,  
+                                title="🗺️ 应用消耗全景 (面积=时长, 颜色深浅=功耗)",  
+                                color_continuous_scale='YlOrRd'  
+                            )  
+                            fig_tree.update_layout(height=380)  
+                            st.plotly_chart(fig_tree, use_container_width=True)  
+                  
+                st.markdown("### 📝 运行明细记录")  
+                display_cols = [c for c in ['id', 'data', app_col, dur_col, pwr_col] if c in detail.columns]  
+                st.dataframe(detail[display_cols].reset_index(drop=True), use_container_width=True, height=400, hide_index=True)  
+        else:  
+            st.warning("🚨 未检测到应用明细数据，请确认 data_source 目录中包含带 'app_detail' 关键字的 Excel 文件。")
+
+else:
+    # ====== 最关键的调试提示区域 ======
+    st.error("🚨 后台未提取到任何有效数据，页面无法渲染！")
+    st.info("""
+    **排查指南 (为什么会走到这一步？)**
+    1. 您的 `data_source` 目录下是否有后缀为 `.xls` 或 `.xlsx` 的文件？
+    2. 您的 Excel **文件名称**是否包含了代码顶端 `TABLE_CONFIGS` 中的 `keyword`？ (例如: `*_standby.xlsx`、`*_apps_*.xlsx`)
+    3. 您的 Excel **真实表头 (第一行)** 是否和代码顶端 `TABLE_CONFIGS` 配置的中文名称完全一致？如果不一致，**必须修改代码顶端的配置字典**。
+    4. 系统已经尝试自动兼容类似 `SN/DeviceID` 和 `Date` 的字段，如果您用了其他的名字作为设备ID和日期，请修改代码里的 `standardize_columns` 函数映射！
+    """)

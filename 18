@@ -1,0 +1,97 @@
+elif menu == "📦 报表导出中心":  
+        st.info("💡 默认将根据全局漏斗范围全量导出。您也可以开启下方的高级筛选，单独剔除/指定特定设备和日期。")  
+          
+        available_ids = sorted(filtered_df['id'].dropna().unique().tolist()) if 'id' in filtered_df.columns else []
+        export_date_config = {}  
+          
+        if available_ids:  
+            with st.container():  
+                st.markdown("#### ⚙️ 导出范围配置")  
+                enable_micro_config = st.checkbox("🚀 开启高级筛选 (仅导出我指定的设备和日期)")  
+                  
+                if enable_micro_config:  
+                    # 修复：只允许用户从 filtered_df 的设备里挑，没被选中的设备绝对不会被导出
+                    target_micro_devices = st.multiselect("🎯 选择要导出的设备", available_ids, default=available_ids)  
+                      
+                    if target_micro_devices:  
+                        st.markdown("##### 👇 分设备日期配置台")  
+                        cols = st.columns(min(len(target_micro_devices), 3) or 1)  
+                        for idx, dev_id in enumerate(target_micro_devices):  
+                            # 日期也继承了全局的数据漏斗范围
+                            dev_dates = sorted(filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())  
+                            with cols[idx % 3]:  
+                                export_date_config[dev_id] = st.multiselect(  
+                                    f"👉 {dev_id}",  
+                                    options=dev_dates,  
+                                    default=dev_dates,  
+                                    key=f"export_{dev_id}"  
+                                )  
+                else:  
+                    # 不开高级筛选：按照全局过滤结果，全量组装
+                    for dev_id in available_ids:  
+                        export_date_config[dev_id] = sorted(filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())  
+                          
+            # ================= 性能优化核心：剥离表格生成计算 =================
+            @st.cache_data(show_spinner=False)
+            def build_excel_bytes(df_source, config_dict):
+                """将沉重的 Excel 生成逻辑放入缓存引擎中，避免拖慢 Streamlit 主线程"""
+                out = io.BytesIO()
+                has_data = False
+                with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                    sheet_name = '透视诊断结果'
+                    current_row = 0
+                    
+                    for dev_id, sel_dates in config_dict.items():
+                        if sel_dates:
+                            chunk = df_source[(df_source["id"] == dev_id) & (df_source["data"].isin(sel_dates))]
+                            if not chunk.empty and 'data' in chunk.columns:
+                                has_data = True
+                                pivot_df = chunk.pivot_table(index=['id', '排序层级', '指标分类'], columns='data', values=['时长', '数值'], aggfunc='first')
+                                new_cols = [f"{c[1]} {c[0]}" for c in pivot_df.columns]
+                                pivot_df.columns = new_cols
+                                
+                                def col_sort_key(c):
+                                    if ' 时长' in c: return c.replace(' 时长', '_0_时长')
+                                    elif ' 数值' in c: return c.replace(' 数值', '_1_数值')
+                                    return c
+                                    
+                                pivot_df = pivot_df.reindex(sorted(pivot_df.columns, key=col_sort_key), axis=1).reset_index()
+                                pivot_df = pivot_df.sort_values(by=['id', '排序层级']).reset_index(drop=True)
+                                pivot_df.drop(columns=['排序层级'], inplace=True, errors='ignore')
+                                pivot_df = hide_repeated(pivot_df, 'id')
+                                
+                                pivot_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=current_row)
+                                current_row += len(pivot_df) + 2
+                    
+                    if not has_data:
+                        pd.DataFrame({"提示": ["暂无满足条件的数据"]}).to_excel(writer, index=False, sheet_name='空数据')
+                    else:
+                        worksheet = writer.sheets[sheet_name]
+                        worksheet.column_dimensions['A'].width = 18
+                        worksheet.column_dimensions['B'].width = 35
+                        for i in range(3, min(26, worksheet.max_column + 1)):
+                            worksheet.column_dimensions[chr(64 + i)].width = 18
+                return out.getvalue()
+            # ================================================================
+
+            st.markdown("<hr style='margin: 30px 0; border: none; border-top: 1px solid #eee;'/>", unsafe_allow_html=True)  
+            
+            if export_date_config:
+                # 只有当参数变化时，后台才会真的去拼 Excel；否则直接秒开
+                with st.spinner("🔄 正在极速生成透视报表中..."):
+                    excel_data = build_excel_bytes(filtered_df, export_date_config)
+                    
+                col_btn_center = st.columns([1, 2, 1])  
+                with col_btn_center[1]:  
+                    st.download_button(  
+                        label="📥 立即生成并下载级联式宽表 (Excel)",  
+                        data=excel_data,  
+                        file_name="诊断结果_断层级联版.xlsx",  
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  
+                        use_container_width=True,  
+                        type="primary"  
+                    )  
+            else:
+                st.warning("⚠️ 必须至少选择一个设备和一天的数据才能生成报表。")
+        else:  
+            st.warning("⚠️ 全局漏斗未命中任何数据，请放宽搜索条件。")

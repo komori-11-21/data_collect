@@ -1,0 +1,1112 @@
+import streamlit as st
+import pandas as pd
+import os
+import glob
+import io
+import plotly.express as px
+
+# =====================================================================
+# 页面初始化配置
+# =====================================================================
+st.set_page_config(
+    page_title="全景功耗监控大屏",
+    page_icon="🌌",
+    layout="wide"
+)
+
+st.markdown("""
+<style>
+/* 强制隐藏自带的英文提示 */
+div[data-testid="InputInstructions"] { display: none !important; }
+.main { background-color: #f4f6f9; }
+.title-box {
+    padding: 30px;
+    background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+    border-radius: 12px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+    margin-bottom: 25px;
+    text-align: center;
+    color: white;
+}
+.title-box h2 {
+    color: white !important;
+    margin: 0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-weight: 600;
+    letter-spacing: 1px;
+}
+div[data-testid="metric-container"] {
+    background-color: white;
+    padding: 15px 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    border-left: 4px solid #2a5298;
+}
+/* 侧边栏样式 */
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    padding: 12px 15px;
+    background-color: transparent;
+    border-radius: 8px;
+    margin-bottom: 5px;
+    transition: all 0.2s ease;
+    cursor: pointer;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background-color: #f0f2f6;
+    transform: translateX(4px);
+}
+[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child { display: none !important; }
+[data-testid="stSidebar"] [role="radiogroup"] div[data-testid="stMarkdownContainer"] p {
+    font-size: 16px;
+    font-weight: 500;
+    margin: 0;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label[aria-checked="true"] {
+    background-color: #e6f0fa !important;
+    border-left: 4px solid #1e3c72 !important;
+    color: #1e3c72 !important;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label[aria-checked="true"] p {
+    color: #1e3c72 !important;
+    font-weight: bold;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =====================================================================
+# 🛠️ 核心硬编码配置区
+# =====================================================================
+DATA_DIR = "./data_source"
+JOIN_KEYS = ["id", "data"]
+BATTERY_FILE_KEYWORDS = ["battery", "电量"]
+BATTERY_DATE_COLUMNS = ["data", "date", "日期", "测试日期"]
+BATTERY_TIME_COLUMNS = ["采集时间", "发生时间", "打印时间", "时间", "timestamp", "datetime", "time", "record_time", "log_time"]
+BATTERY_LEVEL_COLUMNS = ["电量", "电量百分比", "剩余电量", "battery", "battery_level", "level", "soc"]
+SLEEP_EXIT_FILE_KEYWORDS = ["退出休眠", "唤醒", "wake", "exit_sleep", "sleep_exit"]
+SLEEP_EXIT_COUNT_COLUMNS = ["退出休眠次数", "次数", "count", "wake_count", "exit_count"]
+SLEEP_EXIT_REASON_COLUMNS = ["退出休眠原因", "原因", "唤醒原因", "reason", "wake_reason"]
+HOUR_COLUMNS = ["小时", "时段", "hour", "Hour"]
+WEAR_FILE_KEYWORDS = ["佩戴", "摘下", "wear", "wearing"]
+WEAR_EVENT_COLUMNS = ["事件", "状态", "动作", "摘戴状态", "佩戴状态", "event", "status", "action"]
+AUXILIARY_FILE_KEYWORDS = BATTERY_FILE_KEYWORDS + SLEEP_EXIT_FILE_KEYWORDS + WEAR_FILE_KEYWORDS
+
+# 导出报表左侧指标/应用的优先顺序；未配置的项目会按原有层级和名称继续排列。
+# “待机”会被强制放在第一行，即使这里没有配置。
+EXPORT_ITEM_ORDER = ["待机"]
+
+# ⚠️ 注意：修改此处的 val_col, time_col, item_col 等为真实Excel的列名！
+TABLE_CONFIGS = [
+    {
+        "keyword": "standby",
+        "type": "wide",
+        "label": "待机",
+        "val_col": "待机功耗",
+        "time_col": "待机时长",
+        "val_unit": "mA",
+        "time_unit": "s"
+    },
+    {
+        "keyword": "apps",
+        "type": "long",
+        "item_col": "应用名称",
+        "val_col": "功耗值",
+        "time_col": "使用时长",
+        "val_unit": "mA",
+        "time_unit": "s"
+    },
+    {
+        "keyword": "volume",
+        "type": "long",
+        "item_col": "媒体种类",
+        "val_col": "音量值",
+        "time_col": "持续时长",
+        "val_unit": "%",
+        "time_unit": "s",
+        "dedup_rule": "longest_duration"
+    },
+    {
+        "keyword": "sleep",
+        "type": "wide",
+        "label": "休眠",
+        "val_col": "休眠次数",
+        "val_unit": "次"
+    },
+    {
+        "keyword": "events",
+        "type": "event",
+        "item_col": "状态名",
+        "action_col": "动作"
+    },
+    {
+        "keyword": "app_detail",
+        "type": "app_detail",
+        "app_col": "应用名称",
+        "duration_col": "运行时长",
+        "power_col": "功耗值"
+    }
+]
+
+
+def ensure_mock_data():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+
+
+ensure_mock_data()
+
+
+# =====================================================================
+# 🚀 基础函数定义
+# =====================================================================
+def standardize_columns(df):
+    """智能列名兼容映射函数"""
+    df.columns = df.columns.str.strip()
+    rename_map = {}
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if col_lower in ['id', 'deviceid', 'device_id', '设备id', '设备编号', 'sn', 'uuid', 'mac']:
+            rename_map[col] = 'id'
+        elif col_lower in ['date', 'data', '日期', '时间', '创建时间', '测试日期', 'test_date']:
+            rename_map[col] = 'data'
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+    return df
+
+
+def hide_repeated(df_target, col_name):
+    """用于 UI 显示时的列去重掩码"""
+    if col_name in df_target.columns:
+        s = df_target[col_name].copy()
+        s[s == s.shift()] = ""
+        df_target[col_name] = s
+    return df_target
+
+
+def clean_display_metric(value):
+    text = str(value).strip()
+    text = text.replace("└─", "").replace("⭐", "").strip()
+    if " (" in text:
+        text = text.split(" (", 1)[0].strip()
+    return text
+
+
+def find_column(df, candidates):
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    for name in candidates:
+        hit = normalized.get(str(name).strip().lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def build_timestamp(df, date_col, time_col):
+    if date_col and time_col and date_col != time_col:
+        return pd.to_datetime(
+            df[date_col].astype(str).str.strip() + " " + df[time_col].astype(str).str.strip(),
+            errors='coerce'
+        )
+    if time_col:
+        return pd.to_datetime(df[time_col], errors='coerce')
+    if date_col:
+        return pd.to_datetime(df[date_col], errors='coerce')
+    return pd.Series(pd.NaT, index=df.index)
+
+
+def infer_event_state(value):
+    text = "" if pd.isna(value) else str(value)
+    last_open = text.rfind("开")
+    last_close = text.rfind("关")
+    if last_open == -1 and last_close == -1:
+        return text
+    return "关" if last_close > last_open else "开"
+
+
+# =====================================================================
+# 🗃️ 核心数据加载与计算 (使用缓存隔离性能消耗)
+# =====================================================================
+@st.cache_data(show_spinner=False)
+def load_data():
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))
+    standard_dfs = []
+    debug_logs = [{"全局扫描": f"在 {DATA_DIR} 目录下共找到 {len(all_files)} 个 Excel 文件"}]
+
+    for file_path in all_files:
+        file_name = os.path.basename(file_path).lower()
+        if any(keyword in file_name for keyword in AUXILIARY_FILE_KEYWORDS):
+            continue
+
+        file_log = {"文件名": file_name}
+
+        try:
+            df = pd.read_excel(file_path)
+            file_log["1_原始 Excel 表头"] = list(df.columns)
+            df = standardize_columns(df)
+            file_log["2_智能兼容后的表头"] = list(df.columns)
+
+            if 'data' in df.columns:
+                df['data'] = pd.to_datetime(df['data'], errors='coerce').dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            file_log["状态"] = f"❌ 文件读取崩溃: {str(e)}"
+            debug_logs.append(file_log)
+            continue
+
+        matched_config = next((cfg for cfg in TABLE_CONFIGS if cfg["keyword"].lower() in file_name), None)
+        if not matched_config:
+            file_log["状态"] = "❌ 被丢弃: 文件名没有包含 TABLE_CONFIGS 里的 keyword"
+            debug_logs.append(file_log)
+            continue
+
+        file_log["3_命中的配置项"] = matched_config["keyword"]
+        p_keys = [k for k in JOIN_KEYS if k in df.columns]
+        file_log["4_检出的核心合并键"] = p_keys
+
+        if 'id' not in p_keys or 'data' not in p_keys:
+            file_log["状态"] = "❌ 被丢弃: 表格里找不到 id 或 data！(请检查 standardize_columns 函数)"
+            debug_logs.append(file_log)
+            continue
+
+        order = TABLE_CONFIGS.index(matched_config)
+
+        try:
+            if matched_config["type"] == "wide":
+                sub_df = df.copy()
+                label = matched_config["label"]
+                v_col = matched_config.get("val_col")
+                t_col = matched_config.get("time_col")
+                v_unit = matched_config.get("val_unit", "")
+                t_unit = matched_config.get("time_unit", "")
+
+                unit_suffix = ""
+                if v_unit and t_unit:
+                    unit_suffix = f" ({v_unit} | {t_unit})"
+                elif v_unit:
+                    unit_suffix = f" ({v_unit})"
+
+                sub_df['指标分类'] = label + unit_suffix
+                sub_df['数值'] = sub_df[v_col] if v_col in sub_df.columns else ""
+                sub_df['时长'] = sub_df[t_col] if t_col and t_col in sub_df.columns else ""
+
+                cols_to_keep = [c for c in (p_keys + ['指标分类', '时长', '数值']) if c in sub_df.columns]
+                sub_df = sub_df[cols_to_keep]
+                sub_df['排序层级'] = order
+                standard_dfs.append(sub_df)
+                file_log["状态"] = f"✅ 成功提取 {len(sub_df)} 条宽表数据"
+
+            elif matched_config["type"] == "long":
+                item_col = matched_config.get("item_col")
+                v_col = matched_config.get("val_col")
+                t_col = matched_config.get("time_col")
+                v_unit = matched_config.get("val_unit", "")
+                t_unit = matched_config.get("time_unit", "")
+
+                unit_suffix = f" ({v_unit} | {t_unit})" if v_unit and t_unit else (f" ({v_unit})" if v_unit else "")
+
+                if item_col in df.columns:
+                    sub_df = df.copy()
+
+                    if matched_config.get("dedup_rule") == "longest_duration":
+                        if t_col and t_col in sub_df.columns:
+                            sub_df['duration_tmp'] = pd.to_numeric(sub_df[t_col], errors='coerce').fillna(0)
+                            idx_max = sub_df.groupby(p_keys + [item_col])['duration_tmp'].idxmax()
+                            sub_df = sub_df.loc[idx_max].copy()
+                        elif '发生时间' in sub_df.columns:
+                            sub_df['发生时间'] = pd.to_datetime(sub_df['发生时间'], errors='coerce')
+                            sub_df = sub_df.sort_values(by=p_keys + [item_col, '发生时间'])
+                            sub_df['next_time'] = sub_df.groupby(p_keys + [item_col])['发生时间'].shift(-1)
+                            data_end = pd.to_datetime(sub_df['data']) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                            sub_df['next_time'] = sub_df['next_time'].fillna(data_end)
+                            sub_df['duration_tmp'] = (sub_df['next_time'] - sub_df['发生时间']).dt.total_seconds()
+                            idx_max = sub_df.groupby(p_keys + [item_col])['duration_tmp'].idxmax()
+                            sub_df = sub_df.loc[idx_max].copy()
+
+                    sub_df['指标分类'] = " └─ " + sub_df[item_col].astype(str) + unit_suffix
+                    sub_df['数值'] = sub_df[v_col] if v_col and v_col in sub_df.columns else ""
+                    sub_df['时长'] = sub_df[t_col] if t_col and t_col in sub_df.columns else ""
+
+                    cols_to_keep = [c for c in (p_keys + ['指标分类', '时长', '数值']) if c in sub_df.columns]
+                    sub_df = sub_df[cols_to_keep]
+                    sub_df['排序层级'] = order
+                    standard_dfs.append(sub_df)
+                    file_log["状态"] = f"✅ 成功提取 {len(sub_df)} 条长表数据"
+                else:
+                    file_log["状态"] = f"❌ 找不到 item_col ('{item_col}')"
+
+            elif matched_config["type"] == "event":
+                item_col = matched_config.get("item_col")
+                act_col = matched_config.get("action_col")
+
+                if item_col in df.columns and act_col in df.columns:
+                    sub_df = df.copy()
+                    if '发生时间' in sub_df.columns:
+                        sub_df['发生时间'] = pd.to_datetime(sub_df['发生时间'], errors='coerce')
+                        sub_df = sub_df.sort_values(by=p_keys + [item_col, '发生时间'])
+                        sub_df['prev_act'] = sub_df.groupby(p_keys + [item_col])[act_col].shift(1)
+                        sub_df = sub_df[sub_df[act_col] != sub_df['prev_act']].copy()
+
+                        time_str = sub_df['发生时间'].dt.strftime('%H:%M:%S')
+                        sub_df['轨迹点'] = "[" + time_str + "] " + sub_df[act_col].astype(str)
+                        agg_df = sub_df.groupby(p_keys + [item_col])['轨迹点'].apply(
+                            lambda x: " ➜ ".join(x)).reset_index()
+                        agg_df['数值'] = agg_df['轨迹点']
+                    else:
+                        agg_df = sub_df.groupby(p_keys + [item_col])[act_col].apply(
+                            lambda x: " | ".join(x.astype(str).unique())).reset_index()
+                        agg_df['数值'] = agg_df[act_col]
+
+                    agg_df['指标分类'] = " ⭐ " + agg_df[item_col].astype(str)
+                    agg_df['时长'] = ""
+                    agg_df['排序层级'] = order
+
+                    cols_to_keep = [c for c in (p_keys + ['指标分类', '时长', '数值', '排序层级']) if
+                                    c in agg_df.columns]
+                    standard_dfs.append(agg_df[cols_to_keep])
+                    file_log["状态"] = f"✅ 成功聚合提取 {len(agg_df)} 条事件轨迹"
+                else:
+                    file_log["状态"] = f"❌ 找不到配置的 item_col('{item_col}') 或 action_col('{act_col}')"
+
+        except Exception as deep_e:
+            file_log["状态"] = f"❌ 解析报错：{str(deep_e)}"
+
+        debug_logs.append(file_log)
+
+    if not standard_dfs:
+        return None, debug_logs
+
+    main_df = pd.concat(standard_dfs, ignore_index=True)
+    sort_cols = [k for k in JOIN_KEYS if k in main_df.columns] + ['排序层级']
+    main_df = main_df.sort_values(by=sort_cols).reset_index(drop=True)
+
+    return main_df, debug_logs
+
+
+@st.cache_data(show_spinner=False)
+def load_app_detail_raw():
+    cfg = next((c for c in TABLE_CONFIGS if c.get('type') == 'app_detail'), None)
+    if not cfg: return None
+
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))
+    dfs = []
+    for fp in all_files:
+        if cfg['keyword'].lower() in os.path.basename(fp).lower():
+            try:
+                df = pd.read_excel(fp)
+                df = standardize_columns(df)
+                if 'data' in df.columns:
+                    df['data'] = pd.to_datetime(df['data'], errors='coerce').dt.strftime('%Y-%m-%d')
+                dfs.append(df)
+            except Exception as e:
+                st.error(f"🚨 解析应用明细表 [{os.path.basename(fp)}] 崩溃: {str(e)}")
+                continue
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def load_battery_detail_raw():
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))
+    dfs = []
+
+    for fp in all_files:
+        file_name = os.path.basename(fp).lower()
+        if not any(keyword in file_name for keyword in BATTERY_FILE_KEYWORDS):
+            continue
+
+        try:
+            df = pd.read_excel(fp)
+            df.columns = df.columns.str.strip()
+
+            id_col = find_column(df, ['id', 'deviceid', 'device_id', '设备id', '设备编号', 'sn', 'uuid', 'mac'])
+            date_col = find_column(df, BATTERY_DATE_COLUMNS)
+            time_col = find_column(df, BATTERY_TIME_COLUMNS)
+            level_col = find_column(df, BATTERY_LEVEL_COLUMNS)
+
+            if id_col and id_col != 'id':
+                df.rename(columns={id_col: 'id'}, inplace=True)
+            if not level_col:
+                continue
+
+            if date_col and time_col and date_col != time_col:
+                timestamp = pd.to_datetime(
+                    df[date_col].astype(str).str.strip() + " " + df[time_col].astype(str).str.strip(),
+                    errors='coerce'
+                )
+            elif time_col:
+                timestamp = pd.to_datetime(df[time_col], errors='coerce')
+            elif date_col:
+                timestamp = pd.to_datetime(df[date_col], errors='coerce')
+            else:
+                continue
+
+            clean_df = pd.DataFrame()
+            clean_df['id'] = df['id'] if 'id' in df.columns else ""
+            clean_df['采集时间'] = timestamp
+            clean_df['data'] = clean_df['采集时间'].dt.strftime('%Y-%m-%d')
+            clean_df['电量'] = pd.to_numeric(
+                df[level_col].astype(str).str.replace('%', '', regex=False).str.strip(),
+                errors='coerce'
+            )
+            clean_df = clean_df.dropna(subset=['采集时间', '电量'])
+            if not clean_df.empty:
+                dfs.append(clean_df)
+        except Exception as e:
+            st.error(f"🚨 解析电量详情表 [{os.path.basename(fp)}] 崩溃: {str(e)}")
+            continue
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True).sort_values(['id', '采集时间']).reset_index(drop=True)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def load_sleep_exit_raw():
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))
+    dfs = []
+
+    for fp in all_files:
+        file_name = os.path.basename(fp).lower()
+        if not any(keyword in file_name for keyword in SLEEP_EXIT_FILE_KEYWORDS):
+            continue
+
+        try:
+            df = pd.read_excel(fp)
+            df.columns = df.columns.str.strip()
+
+            id_col = find_column(df, ['id', 'deviceid', 'device_id', '设备id', '设备编号', 'sn', 'uuid', 'mac'])
+            date_col = find_column(df, BATTERY_DATE_COLUMNS)
+            time_col = find_column(df, BATTERY_TIME_COLUMNS)
+            hour_col = find_column(df, HOUR_COLUMNS)
+            count_col = find_column(df, SLEEP_EXIT_COUNT_COLUMNS)
+            reason_col = find_column(df, SLEEP_EXIT_REASON_COLUMNS)
+
+            if id_col and id_col != 'id':
+                df.rename(columns={id_col: 'id'}, inplace=True)
+
+            timestamp = build_timestamp(df, date_col, time_col)
+
+            clean_df = pd.DataFrame()
+            clean_df['id'] = df['id'] if 'id' in df.columns else ""
+            clean_df['采集时间'] = timestamp
+            if date_col:
+                clean_df['data'] = pd.to_datetime(df[date_col], errors='coerce').dt.strftime('%Y-%m-%d')
+            else:
+                clean_df['data'] = clean_df['采集时间'].dt.strftime('%Y-%m-%d')
+
+            if hour_col:
+                hour_text = df[hour_col].astype(str).str.extract(r'(\d{1,2})', expand=False)
+                clean_df['小时'] = pd.to_numeric(hour_text, errors='coerce')
+            else:
+                clean_df['小时'] = clean_df['采集时间'].dt.hour
+
+            if count_col:
+                clean_df['次数'] = pd.to_numeric(df[count_col], errors='coerce').fillna(0)
+            else:
+                clean_df['次数'] = 1
+
+            clean_df['原因'] = df[reason_col].astype(str).str.strip() if reason_col else "全部"
+            clean_df = clean_df.dropna(subset=['data', '小时'])
+            clean_df = clean_df[(clean_df['小时'] >= 0) & (clean_df['小时'] <= 23)]
+            if not clean_df.empty:
+                clean_df['小时'] = clean_df['小时'].astype(int)
+                dfs.append(clean_df)
+        except Exception as e:
+            st.error(f"🚨 解析退出休眠表 [{os.path.basename(fp)}] 崩溃: {str(e)}")
+            continue
+
+    if dfs:
+        result = pd.concat(dfs, ignore_index=True).sort_values(['id', 'data', '小时']).reset_index(drop=True)
+        has_reason = result['原因'].ne("全部").groupby([result['id'], result['data'], result['小时']]).transform('any')
+        result = result[~(has_reason & result['原因'].eq("全部"))]
+        return result.reset_index(drop=True)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def load_wear_detail_raw():
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xls*"))
+    dfs = []
+
+    for fp in all_files:
+        file_name = os.path.basename(fp).lower()
+        if not any(keyword in file_name for keyword in WEAR_FILE_KEYWORDS):
+            continue
+
+        try:
+            df = pd.read_excel(fp)
+            df.columns = df.columns.str.strip()
+
+            id_col = find_column(df, ['id', 'deviceid', 'device_id', '设备id', '设备编号', 'sn', 'uuid', 'mac'])
+            date_col = find_column(df, BATTERY_DATE_COLUMNS)
+            time_col = find_column(df, BATTERY_TIME_COLUMNS)
+            event_col = find_column(df, WEAR_EVENT_COLUMNS)
+
+            if id_col and id_col != 'id':
+                df.rename(columns={id_col: 'id'}, inplace=True)
+
+            timestamp = build_timestamp(df, date_col, time_col)
+
+            if event_col:
+                event_text = df[event_col].astype(str)
+            else:
+                event_text = df.astype(str).agg(" ".join, axis=1)
+
+            clean_df = pd.DataFrame()
+            clean_df['id'] = df['id'] if 'id' in df.columns else ""
+            clean_df['采集时间'] = timestamp
+            clean_df['data'] = clean_df['采集时间'].dt.strftime('%Y-%m-%d')
+            clean_df['小时'] = clean_df['采集时间'].dt.hour
+            clean_df['状态'] = event_text.apply(
+                lambda x: "摘下" if "摘" in str(x) or str(x).lower() in ["off", "remove", "removed"]
+                else ("佩戴" if "佩" in str(x) or str(x).lower() in ["on", "wear", "worn"] else str(x))
+            )
+            clean_df = clean_df.dropna(subset=['采集时间'])
+            if not clean_df.empty:
+                dfs.append(clean_df)
+        except Exception as e:
+            st.error(f"🚨 解析摘戴详情表 [{os.path.basename(fp)}] 崩溃: {str(e)}")
+            continue
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True).sort_values(['id', '采集时间']).reset_index(drop=True)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def build_excel_bytes(df_source, config_dict):
+    """按设备生成横向诊断报表。"""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    def clean_metric_name(value):
+        text = str(value).strip()
+        text = text.replace("└─", "").replace("⭐", "").strip()
+        if " (" in text:
+            text = text.split(" (", 1)[0].strip()
+        return text
+
+    def format_date_header(value):
+        dt = pd.to_datetime(value, errors="coerce")
+        if pd.isna(dt):
+            return str(value)
+        return f"{dt.year}/{dt.month}/{dt.day}"
+
+    def format_sleep_date(value):
+        dt = pd.to_datetime(value, errors="coerce")
+        if pd.isna(dt):
+            return str(value)
+        return f"{dt.month}月{dt.day}日"
+
+    def event_state(value):
+        text = "" if pd.isna(value) else str(value)
+        last_open = text.rfind("开")
+        last_close = text.rfind("关")
+        if last_open == -1 and last_close == -1:
+            return text
+        return "关" if last_close > last_open else "开"
+
+    def first_value(df, metric, date_value, col_name):
+        hit = df[(df["指标名称"] == metric) & (df["data"] == date_value)]
+        if hit.empty or col_name not in hit.columns:
+            return ""
+        value = hit.iloc[0][col_name]
+        return "" if pd.isna(value) else value
+
+    def export_order_key(row):
+        metric = row["指标名称"]
+        priority = ["待机"] + [item for item in EXPORT_ITEM_ORDER if item != "待机"]
+        if metric in priority:
+            return (0, priority.index(metric), "")
+        return (1, row["排序层级"], metric)
+
+    out = io.BytesIO()
+    has_data = False
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        sheet_name = '透视诊断结果'
+        workbook = writer.book
+        worksheet = workbook.create_sheet(sheet_name)
+        writer.sheets[sheet_name] = worksheet
+        current_row = 1
+
+        thin_gray = Side(style="thin", color="D9D9D9")
+        border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+        header_fill = PatternFill("solid", fgColor="E2F0D9")
+        center = Alignment(horizontal="center", vertical="center")
+        left = Alignment(horizontal="left", vertical="center")
+        right = Alignment(horizontal="right", vertical="center")
+
+        for dev_id, sel_dates in config_dict.items():
+            if sel_dates:
+                chunk = df_source[(df_source["id"] == dev_id) & (df_source["data"].isin(sel_dates))]
+                if not chunk.empty and 'data' in chunk.columns:
+                    has_data = True
+                    chunk = chunk.copy()
+                    chunk["指标名称"] = chunk["指标分类"].apply(clean_metric_name)
+                    dates = sorted(chunk["data"].dropna().unique().tolist(), key=lambda x: pd.to_datetime(x))
+
+                    event_df = chunk[chunk["指标分类"].astype(str).str.contains("⭐", na=False)].copy()
+                    sleep_df = chunk[chunk["指标名称"] == "休眠"].copy()
+                    metric_df = chunk[
+                        (~chunk["指标分类"].astype(str).str.contains("⭐", na=False)) &
+                        (chunk["指标名称"] != "休眠")
+                    ].copy()
+
+                    metric_order = (
+                        metric_df[["排序层级", "指标名称"]]
+                        .drop_duplicates()
+                    )
+                    metric_order["导出排序"] = metric_order.apply(export_order_key, axis=1)
+                    metric_order = metric_order.sort_values("导出排序")
+                    metrics = metric_order["指标名称"].tolist()
+                    row_count = max(len(metrics), len(dates), 1) + 1
+                    start_row = current_row
+                    end_row = start_row + row_count - 1
+
+                    worksheet.cell(start_row, 1, "id")
+                    worksheet.cell(start_row, 2, dev_id)
+
+                    col = 3
+                    for date_value in dates:
+                        worksheet.merge_cells(start_row=start_row, start_column=col, end_row=start_row, end_column=col + 1)
+                        worksheet.cell(start_row, col, format_date_header(date_value))
+                        col += 2
+
+                    event_names = (
+                        event_df["指标名称"].dropna().drop_duplicates().tolist()
+                        if not event_df.empty else []
+                    )
+                    event_start_col = col
+                    for event_name in event_names:
+                        worksheet.merge_cells(start_row=start_row, start_column=col, end_row=start_row, end_column=col + 1)
+                        worksheet.cell(start_row, col, event_name)
+                        for idx, date_value in enumerate(dates, start=start_row + 1):
+                            worksheet.cell(idx, col, format_sleep_date(date_value))
+                            value = first_value(event_df, event_name, date_value, "数值")
+                            worksheet.cell(idx, col + 1, event_state(value) if value != "" else "")
+                        col += 2
+
+                    sleep_col = col
+                    worksheet.cell(start_row, sleep_col, "休眠（次）")
+                    for idx, date_value in enumerate(dates, start=start_row + 1):
+                        worksheet.cell(idx, sleep_col, format_sleep_date(date_value))
+                        worksheet.cell(idx, sleep_col + 1, first_value(sleep_df, "休眠", date_value, "数值"))
+
+                    for idx, metric in enumerate(metrics, start=start_row + 1):
+                        worksheet.cell(idx, 2, metric)
+                        value_col = 3
+                        for date_value in dates:
+                            worksheet.cell(idx, value_col, first_value(metric_df, metric, date_value, "时长"))
+                            worksheet.cell(idx, value_col + 1, first_value(metric_df, metric, date_value, "数值"))
+                            value_col += 2
+
+                    for row in worksheet.iter_rows(min_row=start_row, max_row=end_row, min_col=1, max_col=sleep_col + 1):
+                        for cell in row:
+                            cell.border = border
+                            cell.alignment = right if isinstance(cell.value, (int, float)) else left
+                            if cell.row == start_row:
+                                cell.alignment = center if cell.column >= 3 else left
+                                cell.font = Font(bold=False)
+
+                    for col_idx in range(event_start_col, sleep_col):
+                        worksheet.cell(start_row, col_idx).fill = header_fill
+                        worksheet.cell(start_row + 1, col_idx).alignment = center
+                    worksheet.cell(start_row, sleep_col).fill = header_fill
+
+                    current_row = end_row + 2
+
+        if not has_data:
+            pd.DataFrame({"提示": ["暂无满足条件的数据"]}).to_excel(writer, index=False, sheet_name='空数据')
+        else:
+            worksheet.column_dimensions['A'].width = 18
+            worksheet.column_dimensions['B'].width = 28
+            for i in range(3, worksheet.max_column + 1):
+                worksheet.column_dimensions[get_column_letter(i)].width = 16
+    return out.getvalue()
+
+
+# =====================================================================
+# 📊 页面 UI 渲染区
+# =====================================================================
+with st.spinner("🚀 引擎极速启动中..."):
+    main_df, debug_logs = load_data()
+    app_detail_df = load_app_detail_raw()
+    battery_detail_df = load_battery_detail_raw()
+    sleep_exit_df = load_sleep_exit_raw()
+    wear_detail_df = load_wear_detail_raw()
+
+if main_df is not None and not main_df.empty:
+    # ------------------ 错误透视区 ------------------
+    error_logs = [log for log in debug_logs if isinstance(log, dict) and "❌" in log.get("状态", "")]
+    if error_logs:
+        st.warning(f"⚠️ 提示：大屏已加载，但在后台清洗数据时，有 {len(error_logs)} 个文件遇到了阻碍！")
+        with st.expander("🛠️ 点击查看报错文件详情"):
+            for log in error_logs:
+                st.error(f"文件：{log.get('文件名')} \n\n报错原因：{log.get('状态')}")
+                st.json(log)
+
+    # ------------------ 侧边栏导航 ------------------
+    with st.sidebar:
+        st.markdown("## 🧭 系统导航")
+        menu = st.radio("请选择控制台模块", ["📊 全景数据大盘", "📦 报表导出中心", "📱 应用钻取分析"])
+
+    date_series = pd.to_datetime(main_df["data"].dropna(), errors='coerce').dropna()
+    min_date = date_series.min().date() if not date_series.empty else pd.Timestamp.today().date()
+    max_date = date_series.max().date() if not date_series.empty else pd.Timestamp.today().date()
+
+    if menu == "📊 全景数据大盘":
+        st.markdown('<div class="title-box"><h2>🌌 智能数据中台：设备单日诊断大屏</h2></div>', unsafe_allow_html=True)
+    elif menu == "📦 报表导出中心":
+        st.markdown(
+            '<div class="title-box" style="background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%);"><h2>📦 智能数据中台：高级报表批量导出车间</h2></div>',
+            unsafe_allow_html=True)
+
+    filtered_df = main_df.copy()
+
+    # 🎯 路由分发区 (主舞台)
+    # ==========================================
+    if menu == "📊 全景数据大盘":
+        available_ids = sorted(main_df['id'].dropna().unique().tolist()) if 'id' in main_df.columns else []
+        if not available_ids:
+            st.warning("⚠️ 暂未检测到可诊断的设备。")
+        else:
+            with st.expander("🔍 诊断对象", expanded=True):
+                col_f1, col_f2 = st.columns([2, 2])
+                with col_f1:
+                    selected_device = st.selectbox("🎯 设备 ID", available_ids)
+
+                device_df = main_df[main_df["id"] == selected_device].copy()
+                available_dates = sorted(device_df["data"].dropna().unique().tolist())
+                with col_f2:
+                    selected_day = st.selectbox("📅 诊断日期", available_dates)
+
+            day_df = device_df[device_df["data"] == selected_day].copy()
+            day_df["指标名称"] = day_df["指标分类"].apply(clean_display_metric)
+            event_df = day_df[day_df["指标分类"].astype(str).str.contains("⭐", na=False)].copy()
+            normal_df = day_df[~day_df["指标分类"].astype(str).str.contains("⭐", na=False)].copy()
+
+            standby_df = normal_df[normal_df["指标名称"] == "待机"]
+            sleep_df = normal_df[normal_df["指标名称"] == "休眠"]
+            power_event_df = event_df[event_df["指标名称"] == "省电模式"]
+
+            standby_power = standby_df["数值"].iloc[0] if not standby_df.empty else "—"
+            standby_duration = standby_df["时长"].iloc[0] if not standby_df.empty else "—"
+            sleep_count = sleep_df["数值"].iloc[0] if not sleep_df.empty else "—"
+            power_state = infer_event_state(power_event_df["数值"].iloc[0]) if not power_event_df.empty else "—"
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("⚡ 待机功耗", f"{standby_power} mA" if standby_power != "—" else "—")
+            col2.metric("⏱️ 待机时长", f"{standby_duration} s" if standby_duration != "—" else "—")
+            col3.metric("🌙 休眠次数", f"{sleep_count} 次" if sleep_count != "—" else "—")
+            col4.metric("🔋 省电模式", power_state)
+
+            st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px dashed #ccc;'/>", unsafe_allow_html=True)
+            st.markdown(f"### 🗂️ {selected_device} / {selected_day} 诊断概览")
+
+            detail_df = normal_df[~normal_df["指标名称"].isin(["待机", "休眠"])].copy()
+            app_df = detail_df[~detail_df["指标名称"].str.contains("音量", na=False)].copy()
+            volume_df = detail_df[detail_df["指标名称"].str.contains("音量", na=False)].copy()
+
+            view_left, view_right = st.columns(2)
+            with view_left:
+                st.markdown("#### 📱 应用使用")
+                if app_df.empty:
+                    st.info("当前日期没有应用使用记录。")
+                else:
+                    app_show = app_df[["指标名称", "时长", "数值"]].rename(
+                        columns={"指标名称": "应用", "时长": "使用时长(s)", "数值": "功耗(mA)"}
+                    )
+                    st.dataframe(app_show.reset_index(drop=True), use_container_width=True, hide_index=True, height=260)
+
+            with view_right:
+                st.markdown("#### 🔊 音量状态")
+                if volume_df.empty:
+                    st.info("当前日期没有音量状态记录。")
+                else:
+                    volume_show = volume_df[["指标名称", "时长", "数值"]].rename(
+                        columns={"指标名称": "媒体类型", "时长": "持续时长(s)", "数值": "音量值(%)"}
+                    )
+                    st.dataframe(volume_show.reset_index(drop=True), use_container_width=True, hide_index=True, height=260)
+
+            st.markdown("#### 🧭 状态事件")
+            if event_df.empty:
+                st.info("当前日期没有状态事件记录。")
+            else:
+                event_show = event_df[["指标名称", "数值"]].rename(columns={"指标名称": "状态项", "数值": "事件轨迹"})
+                event_show["当前结论"] = event_show["事件轨迹"].apply(infer_event_state)
+                event_show = event_show[["状态项", "当前结论", "事件轨迹"]]
+                st.dataframe(event_show.reset_index(drop=True), use_container_width=True, hide_index=True, height=180)
+
+            with st.expander("🧾 查看当天原始明细"):
+                raw_show = day_df.drop(columns=["排序层级", "指标名称"], errors="ignore").rename(
+                    columns={"id": "设备ID", "data": "日期", "指标分类": "指标", "时长": "时长", "数值": "数值"}
+                )
+                st.dataframe(raw_show.reset_index(drop=True), use_container_width=True, hide_index=True, height=360)
+
+    elif menu == "📦 报表导出中心":
+        with st.expander("🔍 数据漏斗 (全局范围限制)", expanded=True):
+            with st.form(key="global_filter_form"):
+                col_f1, col_f2, col_f3 = st.columns([3, 3, 2])
+                with col_f1:
+                    selected_id = st.text_input("🎯 设备 ID (模糊搜索，留空查全量)")
+                with col_f2:
+                    selected_date_range = st.date_input("📅 筛选日期区间", value=(min_date, max_date), min_value=min_date,
+                                                        max_value=max_date)
+                with col_f3:
+                    st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                    st.form_submit_button("应用筛选条件", use_container_width=True)
+
+        if selected_id.strip():
+            filtered_df = filtered_df[filtered_df["id"].astype(str).str.contains(selected_id.strip(), case=False, na=False)]
+
+        if selected_date_range:
+            if len(selected_date_range) == 2:
+                s_d, e_d = selected_date_range
+                filtered_df = filtered_df[
+                    (pd.to_datetime(filtered_df["data"]).dt.date >= s_d) &
+                    (pd.to_datetime(filtered_df["data"]).dt.date <= e_d)
+                    ]
+            elif len(selected_date_range) == 1:
+                s_d = selected_date_range[0]
+                filtered_df = filtered_df[pd.to_datetime(filtered_df["data"]).dt.date == s_d]
+
+        st.info("💡 默认将根据全局漏斗范围全量导出。您也可以开启下方的高级筛选，单独剔除或指定要导出的设备。")
+
+        available_ids = sorted(filtered_df['id'].dropna().unique().tolist()) if 'id' in filtered_df.columns else []
+        export_date_config = {}
+
+        if available_ids:
+            with st.container():
+                st.markdown("#### ⚙️ 导出范围配置")
+                enable_micro_config = st.checkbox("🚀 开启高级筛选 (仅导出我选中的设备和日期)")
+
+                if enable_micro_config:
+                    target_micro_devices = st.multiselect("🎯 选择要导出的设备", available_ids, default=available_ids)
+                    if target_micro_devices:
+                        st.markdown("##### 👇 分设备日期配置台")
+                        cols = st.columns(min(len(target_micro_devices), 3) or 1)
+                        for idx, dev_id in enumerate(target_micro_devices):
+                            dev_dates = sorted(filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())
+                            with cols[idx % 3]:
+                                export_date_config[dev_id] = st.multiselect(
+                                    f"👉 {dev_id}",
+                                    options=dev_dates,
+                                    default=[],
+                                    key=f"export_{dev_id}"
+                                )
+                else:
+                    for dev_id in available_ids:
+                        export_date_config[dev_id] = sorted(
+                            filtered_df[filtered_df['id'] == dev_id]['data'].unique().tolist())
+
+            st.markdown("<hr style='margin: 30px 0; border: none; border-top: 1px solid #eee;'/>",
+                        unsafe_allow_html=True)
+
+            has_selected_export_dates = any(export_date_config.values())
+
+            if has_selected_export_dates:
+                with st.spinner("🔄 正在极速生成透视报表中..."):
+                    excel_data = build_excel_bytes(filtered_df, export_date_config)
+
+                col_btn_center = st.columns([1, 2, 1])
+                with col_btn_center[1]:
+                    st.download_button(
+                        label="📥 立即生成并下载横向诊断报表 (Excel)",
+                        data=excel_data,
+                        file_name="诊断结果_横向诊断版.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
+            else:
+                st.warning("⚠️ 必须至少选择一个设备和一天的数据才能生成报表。")
+        else:
+            st.warning("⚠️ 全局漏斗未命中任何数据，请放宽搜索条件。")
+
+    elif menu == "📱 应用钻取分析":
+        st.markdown(
+            '<div class="title-box" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);"><h2>📱 应用运行明细钻取分析</h2></div>',
+            unsafe_allow_html=True)
+
+        if app_detail_df is not None and not app_detail_df.empty:
+            cfg = next((c for c in TABLE_CONFIGS if c.get('type') == 'app_detail'), {})
+            app_col = cfg.get('app_col', '应用名称')
+            dur_col = cfg.get('duration_col', '运行时长')
+            pwr_col = cfg.get('power_col', '功耗值')
+
+            st.markdown("#### 🎯 钻取条件")
+            ctl1, ctl2, ctl3, ctl4 = st.columns([2, 2, 2, 2])
+
+            with ctl1:
+                avail_ids = sorted(app_detail_df['id'].unique().tolist()) if 'id' in app_detail_df.columns else []
+                sel_dev = st.selectbox("🖥️ 选择设备", avail_ids)
+
+            dev_df = app_detail_df[app_detail_df['id'] == sel_dev] if sel_dev else app_detail_df
+
+            with ctl2:
+                avail_dates = sorted(dev_df['data'].unique().tolist()) if 'data' in dev_df.columns else []
+                sel_date = st.selectbox("📅 选择日期", avail_dates)
+
+            date_df = dev_df[dev_df['data'] == sel_date] if sel_date else dev_df
+
+            with ctl3:
+                avail_apps = sorted(date_df[app_col].unique().tolist()) if app_col in date_df.columns else []
+                sel_app = st.selectbox("📱 选择应用", ["全部应用"] + avail_apps)
+
+            with ctl4:
+                min_duration = st.number_input("⏱ 时长阈值 (秒)，仅展示≥此值的记录", min_value=0, value=0, step=10)
+
+            detail = date_df.copy()
+            if sel_app != "全部应用":
+                detail = detail[detail[app_col] == sel_app]
+            if min_duration > 0 and dur_col in detail.columns:
+                detail[dur_col] = pd.to_numeric(detail[dur_col], errors='coerce').fillna(0)
+                detail = detail[detail[dur_col] >= min_duration]
+
+            st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px dashed #ccc;'/>",
+                        unsafe_allow_html=True)
+
+            if detail.empty:
+                st.warning("⚠️ 当前条件下无匹配记录，请调低时长阈值或更换筛选。")
+            else:
+                total_runs = len(detail)
+                total_dur = pd.to_numeric(detail[dur_col], errors='coerce').sum() if dur_col in detail.columns else 0
+                total_pwr = pd.to_numeric(detail[pwr_col], errors='coerce').sum() if pwr_col in detail.columns else 0
+                avg_dur = total_dur / total_runs if total_runs > 0 else 0
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("🔁 运行次数", f"{total_runs} 次")
+                m2.metric("⏱ 总时长", f"{total_dur:.0f} 秒")
+                m3.metric("⚡ 总功耗", f"{total_pwr:.0f} mA")
+                m4.metric("📊 平均时长", f"{avg_dur:.1f} 秒/次")
+
+                st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px dashed #ccc;'/>",
+                            unsafe_allow_html=True)
+
+                chart_df = detail.copy()
+                if dur_col in chart_df.columns: chart_df[dur_col] = pd.to_numeric(chart_df[dur_col],
+                                                                                  errors='coerce').fillna(0)
+                if pwr_col in chart_df.columns: chart_df[pwr_col] = pd.to_numeric(chart_df[pwr_col],
+                                                                                  errors='coerce').fillna(0)
+                chart_df = chart_df.reset_index(drop=True)
+
+                if battery_detail_df is not None and not battery_detail_df.empty and sel_date:
+                    battery_df = battery_detail_df[battery_detail_df['data'] == sel_date].copy()
+                    if sel_dev and 'id' in battery_df.columns:
+                        battery_df = battery_df[battery_df['id'] == sel_dev]
+                    if not battery_df.empty:
+                        st.markdown("### 🔋 当日电量变化曲线")
+                        battery_df = (
+                            battery_df
+                            .set_index('采集时间')
+                            .resample('5min')['电量']
+                            .mean()
+                            .dropna()
+                            .reset_index()
+                        )
+                        fig_battery = px.line(
+                            battery_df,
+                            x='采集时间',
+                            y='电量',
+                            markers=False,
+                            title=f"{sel_dev} / {sel_date} 电量变化",
+                            labels={'采集时间': '时间', '电量': '电量 (%)'}
+                        )
+                        fig_battery.update_traces(line=dict(width=3))
+                        fig_battery.update_layout(height=360, yaxis=dict(range=[0, 100]))
+                        st.plotly_chart(fig_battery, use_container_width=True)
+
+                event_tabs = []
+                sleep_exit_plot_df = pd.DataFrame()
+                wear_plot_df = pd.DataFrame()
+
+                if sleep_exit_df is not None and not sleep_exit_df.empty and sel_date:
+                    sleep_exit_plot_df = sleep_exit_df[sleep_exit_df['data'] == sel_date].copy()
+                    if sel_dev and 'id' in sleep_exit_plot_df.columns:
+                        sleep_exit_plot_df = sleep_exit_plot_df[sleep_exit_plot_df['id'] == sel_dev]
+                    if not sleep_exit_plot_df.empty:
+                        event_tabs.append("退出休眠")
+
+                if wear_detail_df is not None and not wear_detail_df.empty and sel_date:
+                    wear_plot_df = wear_detail_df[wear_detail_df['data'] == sel_date].copy()
+                    if sel_dev and 'id' in wear_plot_df.columns:
+                        wear_plot_df = wear_plot_df[wear_plot_df['id'] == sel_dev]
+                    if not wear_plot_df.empty:
+                        event_tabs.append("摘戴详情")
+
+                if event_tabs:
+                    st.markdown("### 🧭 当日事件分析")
+                    tabs = st.tabs(event_tabs)
+                    tab_index = 0
+
+                    if not sleep_exit_plot_df.empty:
+                        with tabs[tab_index]:
+                            sleep_hour_df = (
+                                sleep_exit_plot_df
+                                .groupby(['小时', '原因'], as_index=False)['次数']
+                                .sum()
+                                .sort_values('小时')
+                            )
+                            fig_sleep_exit = px.bar(
+                                sleep_hour_df,
+                                x='小时',
+                                y='次数',
+                                color='原因',
+                                title=f"{sel_dev} / {sel_date} 每小时退出休眠分布",
+                                labels={'小时': '小时', '次数': '退出休眠次数', '原因': '原因'}
+                            )
+                            fig_sleep_exit.update_layout(height=340, barmode='stack', xaxis=dict(dtick=1))
+                            st.plotly_chart(fig_sleep_exit, use_container_width=True)
+                        tab_index += 1
+
+                    if not wear_plot_df.empty:
+                        with tabs[tab_index]:
+                            fig_wear = px.scatter(
+                                wear_plot_df,
+                                x='采集时间',
+                                y='状态',
+                                color='状态',
+                                title=f"{sel_dev} / {sel_date} 摘下与佩戴时间线",
+                                labels={'采集时间': '时间', '状态': '状态'}
+                            )
+                            fig_wear.update_traces(marker=dict(size=11))
+                            fig_wear.update_layout(height=300)
+                            st.plotly_chart(fig_wear, use_container_width=True)
+
+                if app_col in chart_df.columns and dur_col in chart_df.columns and pwr_col in chart_df.columns:
+                    tree_df = chart_df[chart_df[dur_col] > 0]
+                    if not tree_df.empty:
+                        fig_tree = px.treemap(
+                            tree_df, path=[app_col], values=dur_col, color=pwr_col,
+                            title="🗺️ 应用消耗全景 (面积=时长, 颜色深浅=功耗)",
+                            color_continuous_scale='YlOrRd'
+                        )
+                        fig_tree.update_layout(height=460)
+                        st.plotly_chart(fig_tree, use_container_width=True)
+
+                st.markdown("### 📝 运行明细记录")
+                display_cols = [c for c in ['id', 'data', app_col, dur_col, pwr_col] if c in detail.columns]
+                st.dataframe(detail[display_cols].reset_index(drop=True), use_container_width=True, height=400,
+                             hide_index=True)
+        else:
+            st.warning("🚨 未检测到应用明细数据，请确认 data_source 目录中包含带 'app_detail' 关键字的 Excel 文件。")
+
+else:
+    # ================= 极端情况：完全无数据渲染诊断页 =================
+    st.error("🚨 页面无法渲染，所有数据在校验环节被丢弃！请查看下方《数据流诊断报告》查找原因：")
+    st.markdown("### 🩻 深度诊断日志")
+    st.info("👇 展开下方每一个文件卡片，查看它的【原始列名】是怎样的，为什么它会被【状态：❌ 被丢弃】。")
+
+    for log in debug_logs:
+        if "文件名" in log:
+            icon = "🟢" if "✅" in log.get("状态", "") else "🔴"
+            with st.expander(f"{icon} 文件名: {log['文件名']} | 状态: {log.get('状态', '未知')}"):
+                st.json(log)
+        else:
+            st.write(log)
+
+    st.markdown("""
+    ### 📝 常见排错建议
+    1. **如果在【4_检出的核心合并键】里缺少 `id` 或 `data`**：
+       说明你的真实设备名不叫 "id"，或者日期不叫 "data"。去代码顶部的 `standardize_columns()` 函数补充映射关系即可。
+    2. **如果最后一步提示 `找不到 item_col / val_col`**：
+       说明你在 `TABLE_CONFIGS` 配置的中文表头名称，在真实 Excel 表头里根本不存在（注意中英文冒号或多余空格）。
+    """)

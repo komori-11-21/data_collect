@@ -1,0 +1,23 @@
+def standardize_columns(df):
+    """智能列名兼容映射函数"""
+    # 1. 强制去除列名可能带有的隐藏空格
+    df.columns = df.columns.str.strip()
+    
+    rename_map = {}
+    for col in df.columns:
+        col_lower = str(col).lower()
+        
+        # --- 匹配你的各种 ID 字段 ---
+        # 如果你的真实ID叫别名，加在这个列表里
+        if col_lower in ['id', 'deviceid', 'device_id', '设备id', '设备编号', 'sn', 'uuid']:
+            rename_map[col] = 'id'
+            
+        # --- 匹配你的各种 Date 字段 ---
+        # 兼容真实的 date 字段，并映射到代码底层的 'data'
+        elif col_lower in ['date', 'data', '日期', '时间', '创建时间', '测试日期']:
+            rename_map[col] = 'data'
+            
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+        
+    return df
